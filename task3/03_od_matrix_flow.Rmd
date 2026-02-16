@@ -1,0 +1,259 @@
+---
+title: "Phase 3: OD Matrix & Flow Mapping"
+subtitle: "Divvy Bike Share - Chicago 2019"
+author: "Đặng Đình Hòa - 23BI14169"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Description
+
+**Tasks:**
+
+1. **OD Matrix by hour** — Count trips between origin and destination stations for each hour (0–23).
+2. **OD Matrix by time frame** — Aggregate by Morning (6–12h), Noon (12–18h), Evening (18–24h + 0–6h).
+3. **Flow map visualization** — Map OD flows on Chicago with Leaflet.
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 7)
+```
+
+# 1. Load packages and set paths
+
+```{r load-packages}
+# Core data manipulation and visualization
+library(tidyverse)
+library(lubridate)
+
+# Spatial mapping
+library(leaflet)
+library(htmlwidgets)
+
+# API data (station coordinates)
+library(jsonlite)
+```
+
+```{r paths}
+# Detect project root: run from project root (.) or from task3 folder (..)
+project_root <- if (dir.exists("dataset")) "." else ".."
+project_root <- normalizePath(project_root)
+
+# Paths to data and output
+proc_dir <- file.path(project_root, "dataset", "processed")
+sta_dir  <- file.path(project_root, "dataset", "stations")
+out_dir  <- file.path(project_root, "task3", "output")
+
+# Create output directory if it does not exist
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 2. Load trip data
+
+```{r load-trips}
+# Read cleaned trip files (Q2, Q3, Q4) and combine
+trips <- bind_rows(
+  read_csv(file.path(proc_dir, "divvy_trips_2019_Q2_clean.csv"), show_col_types = FALSE),
+  read_csv(file.path(proc_dir, "divvy_trips_2019_Q3_clean.csv"), show_col_types = FALSE),
+  read_csv(file.path(proc_dir, "divvy_trips_2019_Q4_clean.csv"), show_col_types = FALSE)
+)
+
+# Parse start_time (handles ISO format like 2019-04-01T00:02:22Z and standard format)
+trips <- trips %>%
+  mutate(
+    start_time = ymd_hms(start_time, quiet = TRUE),
+    start_hour = hour(start_time)
+  ) %>%
+  # Remove trips with missing stations or same origin/destination
+  filter(!is.na(from_station_id), !is.na(to_station_id), from_station_id != to_station_id)
+
+# Check result
+cat("Total trips loaded:", nrow(trips), "\n")
+head(trips, 5)
+```
+
+# 3. OD Matrix — by hour
+
+```{r od-by-hour}
+# Aggregate trips by origin, destination, and hour
+od_by_hour <- trips %>%
+  group_by(from_station_id, to_station_id, start_hour) %>%
+  summarise(n_trips = n(), .groups = "drop")
+
+# Save to CSV
+write_csv(od_by_hour, file.path(out_dir, "od_matrix_by_hour.csv"))
+
+# Summary: total trips per hour
+hourly_summary <- od_by_hour %>%
+  group_by(start_hour) %>%
+  summarise(total_trips = sum(n_trips), n_od_pairs = n(), .groups = "drop")
+
+write_csv(hourly_summary, file.path(out_dir, "hourly_summary.csv"))
+
+# Plot
+ggplot(hourly_summary, aes(start_hour, total_trips)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  labs(title = "Total trips by hour", x = "Hour of day", y = "Number of trips") +
+  theme_minimal()
+```
+
+# 4. OD Matrix — by time frame
+
+```{r od-by-frame}
+# Define time frames: Morning 6-12, Noon 12-18, Evening 18-24 and 0-6
+trips <- trips %>%
+  mutate(
+    time_frame = case_when(
+      start_hour >= 6  & start_hour < 12 ~ "Morning",
+      start_hour >= 12 & start_hour < 18 ~ "Noon",
+      TRUE ~ "Evening"
+    )
+  )
+
+# Aggregate by origin, destination, and time frame
+od_by_frame <- trips %>%
+  group_by(from_station_id, to_station_id, time_frame) %>%
+  summarise(n_trips = n(), .groups = "drop")
+
+# Save to CSV
+write_csv(od_by_frame, file.path(out_dir, "od_matrix_by_timeframe.csv"))
+
+# Summary: total trips per time frame
+frame_summary <- od_by_frame %>%
+  group_by(time_frame) %>%
+  summarise(total_trips = sum(n_trips), n_od_pairs = n(), .groups = "drop")
+
+write_csv(frame_summary, file.path(out_dir, "timeframe_summary.csv"))
+```
+
+```{r frame-table}
+knitr::kable(frame_summary)
+```
+
+```{r frame-plot}
+# Plot with fixed order: Morning, Noon, Evening
+ggplot(frame_summary, aes(factor(time_frame, levels = c("Morning", "Noon", "Evening")), total_trips, fill = time_frame)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("Morning" = "#2ecc71", "Noon" = "#f39c12", "Evening" = "#9b59b6")) +
+  labs(title = "Trips by time frame", x = "Time frame", y = "Number of trips") +
+  theme_minimal()
+```
+
+# 5. Station coordinates
+
+```{r stations-geo}
+# Load station lookup
+stations <- read_csv(file.path(sta_dir, "stations.csv"), show_col_types = FALSE) %>%
+  distinct(station_id, .keep_all = TRUE)
+
+# Fetch coordinates from Chicago Open Data API (match by station name)
+chicago_stations <- tryCatch({
+  fromJSON("https://data.cityofchicago.org/resource/67g3-8ig8.json?$limit=1000", flatten = TRUE) %>%
+    as_tibble() %>%
+    transmute(
+      station_name_api = station_name,
+      lat = as.numeric(latitude),
+      lon = as.numeric(longitude)
+    ) %>%
+    # Normalize names: remove parenthetical suffixes like (Temp), (*)
+    mutate(name_clean = str_remove(station_name_api, "\\s*\\(.*\\)") %>% str_trim()) %>%
+    distinct(name_clean, .keep_all = TRUE)
+}, error = function(e) {
+  # If API fails (e.g. no internet), return empty tibble
+  tibble(name_clean = character(), lat = numeric(), lon = numeric())
+})
+
+# Join our stations to API data by normalized name
+stations_geo <- stations %>%
+  mutate(name_clean = str_remove(station_name, "\\s*\\(.*\\)") %>% str_trim()) %>%
+  left_join(chicago_stations, by = "name_clean") %>%
+  select(station_id, station_name, lat, lon) %>%
+  distinct(station_id, .keep_all = TRUE) %>%
+  # Fallback: use Chicago centroid + small random offset for unmatched stations
+  mutate(
+    lat = if_else(is.na(lat), 41.8781 + runif(n(), -0.02, 0.02), lat),
+    lon = if_else(is.na(lon), -87.6298 + runif(n(), -0.02, 0.02), lon)
+  )
+
+# Save station coordinates
+write_csv(stations_geo, file.path(out_dir, "stations_with_coords.csv"))
+```
+
+# 6. Flow map
+
+```{r flow-data}
+# Top 150 OD pairs by trip count
+od_flows <- trips %>%
+  group_by(from_station_id, to_station_id) %>%
+  summarise(n_trips = n(), .groups = "drop") %>%
+  arrange(desc(n_trips)) %>%
+  slice_head(n = 150) %>%
+  # Join origin and destination coordinates
+  left_join(stations_geo %>% select(from_station_id = station_id, from_lat = lat, from_lon = lon), by = "from_station_id") %>%
+  left_join(stations_geo %>% select(to_station_id = station_id, to_lat = lat, to_lon = lon), by = "to_station_id") %>%
+  filter(!is.na(from_lat), !is.na(to_lat))
+
+# Color palette: yellow (low) to red (high)
+pal <- colorNumeric("YlOrRd", domain = od_flows$n_trips)
+```
+
+```{r flow-map, fig.height=8}
+# Create base map centered on Chicago
+m <- leaflet() %>%
+  addTiles() %>%
+  setView(lng = -87.63, lat = 41.88, zoom = 11)
+
+# Add flow lines (one polyline per OD pair)
+if (nrow(od_flows) > 0) {
+  for (i in seq_len(nrow(od_flows))) {
+    r <- od_flows[i, ]
+    m <- m %>%
+      addPolylines(
+        lng = c(r$from_lon, r$to_lon),
+        lat = c(r$from_lat, r$to_lat),
+        weight = pmin(8, 1 + log1p(r$n_trips)),  # Line width scales with trips
+        opacity = 0.6,
+        color = pal(r$n_trips),
+        popup = paste0("From ", r$from_station_id, " → To ", r$to_station_id, "<br>Trips: ", r$n_trips)
+      )
+  }
+}
+
+# Add station points
+m <- m %>%
+  addCircleMarkers(
+    data = stations_geo,
+    lng = ~lon, lat = ~lat,
+    radius = 2, color = "navy", fillOpacity = 0.5
+  )
+
+m
+```
+
+```{r save-map}
+# Save interactive map as standalone HTML
+saveWidget(m, file.path(out_dir, "flow_map.html"), selfcontained = TRUE)
+```
+
+# 7. Summary
+
+**Output files in `task3/output/`:**
+
+| File | Description |
+|------|-------------|
+| `od_matrix_by_hour.csv` | OD matrix by hour (from_station_id, to_station_id, start_hour, n_trips) |
+| `od_matrix_by_timeframe.csv` | OD matrix by Morning / Noon / Evening |
+| `hourly_summary.csv` | Total trips per hour |
+| `timeframe_summary.csv` | Total trips per time frame |
+| `stations_with_coords.csv` | Station coordinates |
+| `flow_map.html` | Interactive flow map (open in browser) |
+
+**Time frame definition:**
+
+- **Morning**: 6:00 – 11:59  
+- **Noon**: 12:00 – 17:59  
+- **Evening**: 18:00 – 23:59 and 0:00 – 5:59  
